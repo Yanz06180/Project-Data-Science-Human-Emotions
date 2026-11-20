@@ -1,9 +1,13 @@
-"""Model Evaluation Pipeline for FER-2013 Custom CNN on Untouched Test Dataset.
+"""Model Evaluation Pipeline for FER-2013 Models on Untouched Test Dataset.
 
-Mengevaluasi model terbaik tersimpan (``models/fer2013_cnn.keras``) terhadap
-seluruh dataset pengujian (``data/raw/test/``, 7.178 citra) menggunakan
-preprocessing identik dengan fase training (grayscale 1-kanal, 48x48,
-normalisasi tunggal [0, 1], tanpa augmentasi).
+Mengevaluasi model tersimpan terhadap seluruh dataset pengujian
+(``data/raw/test/``, 7.178 citra) menggunakan preprocessing identik dengan fase
+training (grayscale 1-kanal, 48x48, normalisasi tunggal [0, 1], tanpa augmentasi).
+
+Mendukung CLI argumen (``--experiment``, ``--model-path``, ``--output-prefix``)
+serta mencatat metrik deployment PRD (``model_size_mb`` dan
+``inference_time_ms_per_image`` dengan 1-batch warm-up) tanpa menimpa artefak
+Baseline.
 
 Jaminan Metodologis:
 - Dataset testing HANYA digunakan untuk evaluasi akhir (read-only).
@@ -13,7 +17,9 @@ Jaminan Metodologis:
 
 from __future__ import annotations
 
+import argparse
 import json
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,10 +36,10 @@ from tensorflow import keras
 from src.config import (
     BEST_MODEL_PATH,
     DEFAULT_BATCH_SIZE,
+    EXP2_BEST_MODEL_PATH,
     FIGURES_DIR,
-    ID_TO_LABEL,
     INPUT_SHAPE,
-    LABEL_TO_ID,
+    MODELS_DIR,
     NUM_CLASSES,
     PROJECT_ROOT,
     RANDOM_SEED,
@@ -43,12 +49,70 @@ from src.config import (
 )
 from src.data_loader import FER2013DataLoader, verify_label_mapping_matches_config
 from src.data_splitting import collect_directory_manifest, load_label_mapping, load_split
+from src.metrics import (
+    CLASS_DISPLAY_NAMES,
+    compute_classification_metrics,
+    format_classification_report,
+)
 
-CLASS_DISPLAY_NAMES: list[str] = [ID_TO_LABEL[i].capitalize() for i in range(NUM_CLASSES)]
-
+# Default baseline output paths (preserved for backward compatibility)
 EVAL_METRICS_JSON: Path = REPORTS_DIR / "evaluation_metrics.json"
 CLASSIFICATION_REPORT_TXT: Path = REPORTS_DIR / "classification_report.txt"
 EVALUATION_REPORT_MD: Path = REPORTS_DIR / "evaluation_report.md"
+
+
+def configure_gpu() -> str:
+    """Enable GPU memory growth safely if available; return human-readable device string."""
+    gpus = tf.config.list_physical_devices("GPU")
+    if gpus:
+        for gpu in gpus:
+            try:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            except RuntimeError:
+                pass
+        return f"GPU ({len(gpus)} device)"
+    return "CPU (TensorFlow oneDNN)"
+
+
+def resolve_default_model_path(experiment: str) -> Path:
+    """Resolve canonical model file path for an experiment name."""
+    if experiment == "baseline":
+        return BEST_MODEL_PATH
+    if experiment == "exp2":
+        return EXP2_BEST_MODEL_PATH
+    return MODELS_DIR / f"fer2013_{experiment}.keras"
+
+
+def resolve_evaluation_paths(
+    experiment: str = "baseline",
+    output_prefix: str | None = None,
+) -> dict[str, Path]:
+    """Resolve isolated evaluation report & figure paths so baseline is never overwritten."""
+    if output_prefix is not None:
+        clean_prefix = output_prefix.strip()
+        if clean_prefix and not clean_prefix.endswith("_"):
+            clean_prefix = f"{clean_prefix}_"
+    else:
+        clean_prefix = "" if experiment == "baseline" else f"{experiment}_"
+
+    if clean_prefix == "":
+        return {
+            "classification_report_txt": CLASSIFICATION_REPORT_TXT,
+            "metrics_json": EVAL_METRICS_JSON,
+            "evaluation_report_md": EVALUATION_REPORT_MD,
+            "confusion_matrix_figure": FIGURES_DIR / "10_test_confusion_matrix.png",
+            "per_class_metrics_figure": FIGURES_DIR / "11_test_per_class_metrics.png",
+            "misclassification_figure": FIGURES_DIR / "12_test_misclassification_analysis.png",
+        }
+
+    return {
+        "classification_report_txt": REPORTS_DIR / f"{clean_prefix}classification_report.txt",
+        "metrics_json": REPORTS_DIR / f"{clean_prefix}evaluation_metrics.json",
+        "evaluation_report_md": REPORTS_DIR / f"{clean_prefix}evaluation_report.md",
+        "confusion_matrix_figure": FIGURES_DIR / f"{clean_prefix}test_confusion_matrix.png",
+        "per_class_metrics_figure": FIGURES_DIR / f"{clean_prefix}test_per_class_metrics.png",
+        "misclassification_figure": FIGURES_DIR / f"{clean_prefix}test_misclassification_analysis.png",
+    }
 
 
 def load_test_data(batch_size: int = DEFAULT_BATCH_SIZE) -> tuple[pd.DataFrame, np.ndarray, np.ndarray]:
@@ -56,7 +120,6 @@ def load_test_data(batch_size: int = DEFAULT_BATCH_SIZE) -> tuple[pd.DataFrame, 
     label_to_id, _ = load_label_mapping(SPLITS_DIR)
     verify_label_mapping_matches_config(label_to_id)
 
-    # Verifikasi silang manifest test.csv terhadap seluruh isi aktual data/raw/test/
     raw_test_manifest = collect_directory_manifest(RAW_TEST_DIR, label_to_id, project_root=PROJECT_ROOT)
     test_csv_path = SPLITS_DIR / "test.csv"
     if test_csv_path.exists():
@@ -69,7 +132,6 @@ def load_test_data(batch_size: int = DEFAULT_BATCH_SIZE) -> tuple[pd.DataFrame, 
         test_df["split"] = "test"
         test_df["abs_path"] = test_df["filepath"].map(lambda rel: str((PROJECT_ROOT / rel).resolve()))
 
-    # Pastikan seluruh path berasal dari data/raw/test/ dan tidak ada augmentasi
     assert all(p.startswith("data/raw/test/") for p in test_df["filepath"])
     test_loader = FER2013DataLoader(
         df=test_df,
@@ -87,144 +149,11 @@ def load_test_data(batch_size: int = DEFAULT_BATCH_SIZE) -> tuple[pd.DataFrame, 
     return test_df, x_test, y_test
 
 
-def compute_confusion_matrix(y_true: np.ndarray, y_pred: np.ndarray, num_classes: int = NUM_CLASSES) -> np.ndarray:
-    """Menghitung confusion matrix (baris = True Label, kolom = Predicted Label)."""
-    cm = np.zeros((num_classes, num_classes), dtype=np.int64)
-    for t, p in zip(y_true, y_pred):
-        cm[int(t), int(p)] += 1
-    return cm
-
-
-def compute_classification_metrics(
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    class_names: list[str] = CLASS_DISPLAY_NAMES,
-) -> dict[str, Any]:
-    """Menghitung Accuracy, per-class Precision/Recall/F1/Support, Macro Avg, dan Weighted Avg."""
-    num_classes = len(class_names)
-    cm = compute_confusion_matrix(y_true, y_pred, num_classes=num_classes)
-    total = int(cm.sum())
-    accuracy = float(np.trace(cm) / total) if total > 0 else 0.0
-
-    per_class: list[dict[str, Any]] = []
-    precisions = []
-    recalls = []
-    f1s = []
-    supports = []
-
-    for idx, name in enumerate(class_names):
-        tp = int(cm[idx, idx])
-        fp = int(cm[:, idx].sum() - tp)
-        fn = int(cm[idx, :].sum() - tp)
-        support = int(cm[idx, :].sum())
-        pred_count = int(cm[:, idx].sum())
-
-        prec = float(tp / (tp + fp)) if (tp + fp) > 0 else 0.0
-        rec = float(tp / (tp + fn)) if (tp + fn) > 0 else 0.0
-        f1 = float(2.0 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
-
-        precisions.append(prec)
-        recalls.append(rec)
-        f1s.append(f1)
-        supports.append(support)
-
-        per_class.append({
-            "label_id": idx,
-            "class_name": name,
-            "precision": round(prec, 6),
-            "recall": round(rec, 6),
-            "f1_score": round(f1, 6),
-            "support": support,
-            "predicted_count": pred_count,
-            "correct_count": tp,
-        })
-
-    sup_arr = np.asarray(supports, dtype=np.float64)
-    prec_arr = np.asarray(precisions, dtype=np.float64)
-    rec_arr = np.asarray(recalls, dtype=np.float64)
-    f1_arr = np.asarray(f1s, dtype=np.float64)
-
-    macro_avg = {
-        "precision": round(float(prec_arr.mean()), 6),
-        "recall": round(float(rec_arr.mean()), 6),
-        "f1_score": round(float(f1_arr.mean()), 6),
-        "support": total,
-    }
-    weighted_avg = {
-        "precision": round(float(np.sum(prec_arr * sup_arr) / total), 6),
-        "recall": round(float(np.sum(rec_arr * sup_arr) / total), 6),
-        "f1_score": round(float(np.sum(f1_arr * sup_arr) / total), 6),
-        "support": total,
-    }
-
-    # Identifikasi pasangan kelas yang paling sering tertukar (off-diagonal confusion)
-    confused_pairs: list[dict[str, Any]] = []
-    for t_idx in range(num_classes):
-        row_total = int(cm[t_idx].sum())
-        for p_idx in range(num_classes):
-            if t_idx == p_idx:
-                continue
-            cnt = int(cm[t_idx, p_idx])
-            if cnt > 0:
-                confused_pairs.append({
-                    "true_id": t_idx,
-                    "true_class": class_names[t_idx],
-                    "pred_id": p_idx,
-                    "pred_class": class_names[p_idx],
-                    "count": cnt,
-                    "pct_of_true_class": round(cnt / row_total * 100, 2) if row_total > 0 else 0.0,
-                })
-    confused_pairs.sort(key=lambda d: d["count"], reverse=True)
-
-    return {
-        "accuracy": round(accuracy, 6),
-        "total_samples": total,
-        "correct_predictions": int(np.trace(cm)),
-        "incorrect_predictions": int(total - np.trace(cm)),
-        "per_class": per_class,
-        "macro_avg": macro_avg,
-        "weighted_avg": weighted_avg,
-        "confusion_matrix": cm.tolist(),
-        "top_confused_pairs": confused_pairs[:10],
-    }
-
-
-def format_classification_report(metrics: dict[str, Any]) -> str:
-    """Memformat Classification Report standar menyerupai scikit-learn."""
-    lines = [
-        "Classification Report — FER-2013 Custom CNN (Test Set)",
-        "=" * 68,
-        f"{'Class':<16}{'Precision':>12}{'Recall':>12}{'F1-Score':>12}{'Support':>12}",
-        "-" * 68,
-    ]
-    for row in metrics["per_class"]:
-        label_str = f"{row['label_id']} = {row['class_name']}"
-        lines.append(
-            f"{label_str:<16}{row['precision']:>12.4f}{row['recall']:>12.4f}"
-            f"{row['f1_score']:>12.4f}{row['support']:>12d}"
-        )
-    lines.append("-" * 68)
-    lines.append(
-        f"{'accuracy':<16}{'':>12}{'':>12}{metrics['accuracy']:>12.4f}{metrics['total_samples']:>12d}"
-    )
-    m = metrics["macro_avg"]
-    w = metrics["weighted_avg"]
-    lines.append(
-        f"{'macro avg':<16}{m['precision']:>12.4f}{m['recall']:>12.4f}"
-        f"{m['f1_score']:>12.4f}{m['support']:>12d}"
-    )
-    lines.append(
-        f"{'weighted avg':<16}{w['precision']:>12.4f}{w['recall']:>12.4f}"
-        f"{w['f1_score']:>12.4f}{w['support']:>12d}"
-    )
-    lines.append("=" * 68)
-    return "\n".join(lines)
-
-
 def plot_confusion_matrix_heatmap(
     cm: np.ndarray,
     class_names: list[str] = CLASS_DISPLAY_NAMES,
     output_path: Path = FIGURES_DIR / "10_test_confusion_matrix.png",
+    title_label: str = "FER-2013 Custom CNN",
 ) -> Path:
     """Membuat heatmap Confusion Matrix dengan nama kelas dan jumlah prediksi (+ %) pada tiap sel."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -233,7 +162,6 @@ def plot_confusion_matrix_heatmap(
 
     fig, axes = plt.subplots(1, 2, figsize=(16.8, 6.8), gridspec_kw={"wspace": 0.45})
 
-    # Panel 1: Jumlah Prediksi Absolut (Counts)
     im1 = axes[0].imshow(cm, interpolation="nearest", cmap="Blues")
     cbar1 = fig.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04)
     cbar1.set_label("Jumlah Prediksi", fontsize=10)
@@ -253,7 +181,6 @@ def plot_confusion_matrix_heatmap(
             weight = "bold" if i == j else "normal"
             axes[0].text(j, i, f"{val:,}", ha="center", va="center", color=color, fontsize=9.5, fontweight=weight)
 
-    # Panel 2: Proporsi per Kelas Aktual (Row-Normalized Recall %)
     im2 = axes[1].imshow(cm_norm * 100.0, interpolation="nearest", cmap="YlGnBu", vmin=0.0, vmax=100.0)
     cbar2 = fig.colorbar(im2, ax=axes[1], fraction=0.046, pad=0.04)
     cbar2.set_label("Persentase per True Class (%)", fontsize=10)
@@ -281,7 +208,7 @@ def plot_confusion_matrix_heatmap(
                 fontweight=weight,
             )
 
-    fig.suptitle("Evaluasi Confusion Matrix — FER-2013 Custom CNN (7.178 Citra Test)", fontsize=14, fontweight="bold", y=0.98)
+    fig.suptitle(f"Evaluasi Confusion Matrix — {title_label} (7.178 Citra Test)", fontsize=14, fontweight="bold", y=0.98)
     fig.subplots_adjust(left=0.07, right=0.95, top=0.86, bottom=0.15, wspace=0.45)
     fig.savefig(output_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
@@ -291,6 +218,7 @@ def plot_confusion_matrix_heatmap(
 def plot_per_class_metrics(
     metrics: dict[str, Any],
     output_path: Path = FIGURES_DIR / "11_test_per_class_metrics.png",
+    title_label: str = "FER-2013 Test Set",
 ) -> Path:
     """Visualisasi Precision, Recall, dan F1-Score per kelas beserta Macro & Weighted F1."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -328,8 +256,8 @@ def plot_per_class_metrics(
     ax.set_xticks(x)
     ax.set_xticklabels(x_labels, fontsize=9.8, fontweight="bold")
     ax.set_ylabel("Skor (%)")
-    ax.set_ylim(0, min(105, max(df["precision"].max(), df["recall"].max(), df["f1_score"].max()) * 100 + 16))
-    ax.set_title("Precision, Recall, dan F1-Score per Kelas Ekspresi — FER-2013 Test Set", fontsize=13.5, fontweight="bold", pad=12)
+    ax.set_ylim(0, min(108, max(df["precision"].max(), df["recall"].max(), df["f1_score"].max()) * 100 + 18))
+    ax.set_title(f"Precision, Recall, dan F1-Score per Kelas Ekspresi — {title_label}", fontsize=13.5, fontweight="bold", pad=12)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     ax.legend(loc="upper right", ncol=2, frameon=True, facecolor="white", fontsize=9)
@@ -347,6 +275,7 @@ def plot_misclassification_analysis(
     y_probs: np.ndarray,
     metrics: dict[str, Any],
     output_path: Path = FIGURES_DIR / "12_test_misclassification_analysis.png",
+    title_label: str = "FER-2013 Test Set",
 ) -> Path:
     """Visualisasi tambahan: Top pasangan kelas tertukar & contoh sampel salah klasifikasi."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -355,7 +284,6 @@ def plot_misclassification_analysis(
     fig = plt.figure(figsize=(14.5, 6.4))
     gs = fig.add_gridspec(2, 6, width_ratios=[2.4, 0.25, 1, 1, 1, 1], hspace=0.42, wspace=0.22)
 
-    # Kiri: Bar chart horizontal 8 pasangan ekspresi paling sering tertukar
     ax_bar = fig.add_subplot(gs[:, 0])
     ax_bar.set_facecolor("#FAFAFA")
     ax_bar.grid(axis="x", linestyle="--", color="#E0E0E0", linewidth=0.7)
@@ -385,7 +313,6 @@ def plot_misclassification_analysis(
     ax_bar.spines["top"].set_visible(False)
     ax_bar.spines["right"].set_visible(False)
 
-    # Kanan: 8 contoh citra salah klasifikasi (1 sampel confidence tinggi dari masing-masing top pair)
     for idx_pair, pair in enumerate(top_pairs[:8]):
         r = idx_pair // 4
         c = 2 + (idx_pair % 4)
@@ -394,7 +321,6 @@ def plot_misclassification_analysis(
         mask = (y_true == pair["true_id"]) & (y_pred == pair["pred_id"])
         candidate_idxs = np.where(mask)[0]
         if len(candidate_idxs) > 0:
-            # Pilih contoh dengan probabilitas prediksi tertinggi (kesalahan paling "yakin")
             confs = y_probs[candidate_idxs, pair["pred_id"]]
             best_idx = int(candidate_idxs[int(np.argmax(confs))])
             conf_val = float(y_probs[best_idx, pair["pred_id"]]) * 100.0
@@ -408,7 +334,7 @@ def plot_misclassification_analysis(
         ax_img.set_xticks([])
         ax_img.set_yticks([])
 
-    fig.suptitle("Analisis Kesalahan Klasifikasi — FER-2013 Test Set", fontsize=14, fontweight="bold", y=1.01)
+    fig.suptitle(f"Analisis Kesalahan Klasifikasi — {title_label}", fontsize=14, fontweight="bold", y=1.01)
     fig.savefig(output_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
     return output_path
@@ -417,9 +343,9 @@ def plot_misclassification_analysis(
 def write_evaluation_report_md(
     payload: dict[str, Any],
     report_text: str,
-    output_path: Path = EVALUATION_REPORT_MD,
+    output_path: Path,
 ) -> Path:
-    """Menulis laporan evaluasi Markdown lengkap yang 100% berbasis hasil prediksi aktual."""
+    """Menulis laporan evaluasi Markdown lengkap termasuk metrik deployment PRD."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     m = payload["metrics"]
     per_class = m["per_class"]
@@ -439,17 +365,17 @@ def write_evaluation_report_md(
         for i, p in enumerate(top5)
     )
 
-    md = f"""# Laporan Model Evaluation — FER-2013 Custom CNN (Test Set)
+    md = f"""# Laporan Model Evaluation — {payload['experiment'].upper()} ({payload['model_name']})
 
-**Proyek:** Klasifikasi Ekspresi Wajah Manusia pada Citra Grayscale (FER-2013) Menggunakan Convolutional Neural Network  
-**Tahap:** Tahap 6 — Model Evaluation (Evaluasi Akhir pada Data Testing)  
-**Model Dievaluasi:** `{payload['model_path']}`  
+**Proyek:** Klasifikasi Ekspresi Wajah Manusia pada Citra Grayscale (FER-2013)  
+**Eksperimen:** `{payload['experiment']}`  
+**Model Dievaluasi:** `{payload['model_path']}` (`{payload['model_params']:,}` parameter, `{payload['model_size_mb']:.4f} MB`)  
 **Data Testing:** `data/raw/test/` (`{m['total_samples']:,}` citra; tanpa augmentasi, tanpa training ulang, tanpa tuning)  
-**Waktu Evaluasi (UTC):** `{payload['evaluated_at_utc']}`
+**Perangkat & Waktu Evaluasi (UTC):** `{payload['device']}` | `{payload['evaluated_at_utc']}`
 
 ---
 
-## 1. Ringkasan Metrik Utama (Test Set)
+## 1. Ringkasan Metrik Utama & Deployment PRD (Test Set)
 
 | Metrik | Nilai Aktual |
 |---|---:|
@@ -458,6 +384,8 @@ def write_evaluation_report_md(
 | **Top-2 Accuracy** | **{payload['top2_accuracy'] * 100:.2f}%** |
 | **Macro Avg Precision / Recall / F1-Score** | `{m['macro_avg']['precision'] * 100:.2f}%` / `{m['macro_avg']['recall'] * 100:.2f}%` / **`{m['macro_avg']['f1_score'] * 100:.2f}%`** |
 | **Weighted Avg Precision / Recall / F1-Score** | `{m['weighted_avg']['precision'] * 100:.2f}%` / `{m['weighted_avg']['recall'] * 100:.2f}%` / **`{m['weighted_avg']['f1_score'] * 100:.2f}%`** |
+| **Model Size (`model_size_mb`)** | **`{payload['model_size_mb']:.4f} MB`** |
+| **Inference Time (`inference_time_ms_per_image`)** | **`{payload['inference_time_ms_per_image']:.4f} ms/citra`** (`{payload['total_inference_time_sec']:.3f}s` total, setelah 1-batch warm-up) |
 | **Rata-rata Confidence (Benar vs Salah)** | `{payload['confidence_stats']['mean_conf_correct'] * 100:.2f}%` vs `{payload['confidence_stats']['mean_conf_incorrect'] * 100:.2f}%` |
 
 ---
@@ -486,17 +414,12 @@ def write_evaluation_report_md(
 
 ---
 
-## 5. Analisis Hasil Evaluasi
+## 5. Ringkasan Analisis Evaluasi
 
-- **Performa Keseluruhan:** Model Custom CNN (`110.983` parameter) mencapai **Test Accuracy {m['accuracy'] * 100:.2f}%**, **Macro F1-Score {m['macro_avg']['f1_score'] * 100:.2f}%**, dan **Weighted F1-Score {m['weighted_avg']['f1_score'] * 100:.2f}%** (dengan Top-2 Accuracy **{payload['top2_accuracy'] * 100:.2f}%**), jauh melampaui baseline tebakan kelas mayoritas (`24,71%` accuracy / `~5,66%` Macro F1 pada test).
-- **Kelas dengan Performa Terbaik:** **`{best_f1['class_name']}`** meraih F1-Score tertinggi sebesar **{best_f1['f1_score'] * 100:.2f}%** (Precision `{best_f1['precision'] * 100:.2f}%`, Recall `{best_f1['recall'] * 100:.2f}%`, support `{best_f1['support']:,}`); Recall tertinggi diraih oleh **`{best_rec['class_name']}`** (`{best_rec['recall'] * 100:.2f}%`).
-- **Kelas dengan Performa Terendah:** **`{worst_f1['class_name']}`** mencatat F1-Score terendah sebesar **{worst_f1['f1_score'] * 100:.2f}%** (Precision `{worst_f1['precision'] * 100:.2f}%`, Recall `{worst_f1['recall'] * 100:.2f}%`, support `{worst_f1['support']:,}`); Recall terendah berada pada **`{worst_rec['class_name']}`** (`{worst_rec['recall'] * 100:.2f}%`).
-- **Ekspresi Paling Sering Tertukar:** Kekeliruan terbanyak secara absolut terjadi pada **{top5[0]['true_class']} → {top5[0]['pred_class']}** (`{top5[0]['count']:,}` sampel; `{top5[0]['pct_of_true_class']:.2f}%` dari `{top5[0]['true_class']}`), diikuti **{top5[1]['true_class']} → {top5[1]['pred_class']}** (`{top5[1]['count']:,}` sampel) dan **{top5[2]['true_class']} → {top5[2]['pred_class']}** (`{top5[2]['count']:,}` sampel).
-- **Kemungkinan Penyebab Kesalahan Klasifikasi:**
-  1. **Kemiripan fitur mikro wajah antar emosi negatif/berdekatan** pada resolusi rendah `48×48` grayscale (misalnya ketegangan alis/mulut antara `Fear`, `Sad`, `Angry`, `Neutral`, serta mata/mulut terbuka antara `Fear` dan `Surprise`).
-  2. **Ketidakseimbangan kelas ekstrem & efek `class_weight`:** Kelas minoritas `Disgust` (hanya `349` citra latih / `1,52%`) diberi bobot tinggi (`9,40×`) saat training sehingga model lebih sensitif memprediksi `Disgust` (menaikkan recall namun dapat menekan precision dan menggeser sebagian prediksi `Angry`/`Fear`/`Sad`).
-  3. **Noise inheren dataset FER-2013** (yang ditemukan saat inspeksi & EDA): ambiguitas pelabelan manusia, duplikat lintas kelas, oklusi wajah oleh tangan, citra non-foto/watermark, serta resolusi kecil `48×48`.
-  4. **Kapasitas arsitektur ringkas (`111K` parameter):** 3 blok konvolusi dengan satu `Conv2D` per blok membatasi kemampuan mengekstrak nuansa ekspresi wajah yang sangat halus dibanding blok konvolusi ganda/lebih dalam.
+- **Performa Keseluruhan:** Model `{payload['model_name']}` mencapai **Test Accuracy {m['accuracy'] * 100:.2f}%**, **Macro F1-Score {m['macro_avg']['f1_score'] * 100:.2f}%**, dan **Weighted F1-Score {m['weighted_avg']['f1_score'] * 100:.2f}%** (Top-2 Accuracy **{payload['top2_accuracy'] * 100:.2f}%**).
+- **Kelas Terbaik:** **`{best_f1['class_name']}`** (F1 **{best_f1['f1_score'] * 100:.2f}%**, Precision `{best_f1['precision'] * 100:.2f}%`, Recall `{best_f1['recall'] * 100:.2f}%`); Recall tertinggi pada **`{best_rec['class_name']}`** (`{best_rec['recall'] * 100:.2f}%`).
+- **Kelas Terendah:** **`{worst_f1['class_name']}`** (F1 **{worst_f1['f1_score'] * 100:.2f}%**, Precision `{worst_f1['precision'] * 100:.2f}%`, Recall `{worst_f1['recall'] * 100:.2f}%`); Recall terendah pada **`{worst_rec['class_name']}`** (`{worst_rec['recall'] * 100:.2f}%`).
+- **Pasangan Tertukar Utama:** **{top5[0]['true_class']} → {top5[0]['pred_class']}** (`{top5[0]['count']:,}`), **{top5[1]['true_class']} → {top5[1]['pred_class']}** (`{top5[1]['count']:,}`), dan **{top5[2]['true_class']} → {top5[2]['pred_class']}** (`{top5[2]['count']:,}`).
 
 ---
 
@@ -513,29 +436,40 @@ def write_evaluation_report_md(
 
 
 def evaluate(
-    model_path: Path = BEST_MODEL_PATH,
+    model_path: Path | None = None,
+    experiment: str = "baseline",
+    output_prefix: str | None = None,
     batch_size: int = DEFAULT_BATCH_SIZE,
 ) -> dict[str, Any]:
-    """Menjalankan evaluasi penuh model terbaik terhadap seluruh data/raw/test/."""
-    if not model_path.exists():
+    """Menjalankan evaluasi penuh model terhadap seluruh data/raw/test/."""
+    device_str = configure_gpu()
+    resolved_model_path = model_path if model_path is not None else resolve_default_model_path(experiment)
+    if not resolved_model_path.exists():
         raise FileNotFoundError(
-            f"Model terbaik tidak ditemukan di {model_path}. Pastikan src/train.py sudah selesai."
+            f"Model tidak ditemukan di {resolved_model_path}. Pastikan training sudah selesai."
         )
 
+    out_paths = resolve_evaluation_paths(experiment=experiment, output_prefix=output_prefix)
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     FIGURES_DIR.mkdir(parents=True, exist_ok=True)
 
-    print("=== MEMUAT MODEL TERBAIK & DATASET TESTING (READ-ONLY) ===", flush=True)
-    t0 = time.perf_counter()
-    model = keras.models.load_model(model_path)
-    test_df, x_test, y_test = load_test_data(batch_size=batch_size)
+    print(f"=== EVALUASI '{experiment}' ({resolved_model_path.name}) PADA TEST SET ===", flush=True)
+    t_total_start = time.perf_counter()
+    model = keras.models.load_model(resolved_model_path)
+    model_size_mb = round(os.path.getsize(resolved_model_path) / (1024 ** 2), 4)
 
+    _, x_test, y_test = load_test_data(batch_size=batch_size)
     test_ds = tf.data.Dataset.from_tensor_slices((x_test, y_test)).batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
-    # Evaluasi resmi (training=False otomatis di evaluate() dan predict())
     test_loss, keras_test_acc = model.evaluate(test_ds, verbose=0)
+
+    # 1-batch warm-up sebelum timer inferensi agar tidak bias inisialisasi graf TensorFlow
+    _ = model.predict(x_test[:batch_size], batch_size=batch_size, verbose=0)
+    t_inf_start = time.perf_counter()
     y_probs = model.predict(test_ds, verbose=0)
-    eval_elapsed = time.perf_counter() - t0
+    total_inference_time_sec = time.perf_counter() - t_inf_start
+    inference_time_ms_per_image = (total_inference_time_sec / len(y_test)) * 1000.0
+    eval_elapsed = time.perf_counter() - t_total_start
 
     assert y_probs.shape == (len(y_test), NUM_CLASSES), f"Output probabilitas salah: {y_probs.shape}"
     assert np.allclose(y_probs.sum(axis=1), 1.0, atol=1e-4), "Probabilitas softmax tidak berjumlah 1!"
@@ -557,21 +491,48 @@ def evaluate(
         f"Selisih akurasi Keras ({keras_test_acc:.6f}) vs manual ({metrics['accuracy']:.6f})!"
     )
 
-    report_text = format_classification_report(metrics)
+    title_label = f"FER-2013 {experiment.upper()} ({model.name})"
+    report_text = format_classification_report(
+        metrics,
+        title=f"Classification Report — {title_label} (Test Set)",
+    )
     cm = np.asarray(metrics["confusion_matrix"], dtype=np.int64)
 
-    # Simpan seluruh visualisasi & laporan
-    cm_fig = plot_confusion_matrix_heatmap(cm, class_names=CLASS_DISPLAY_NAMES)
-    metrics_fig = plot_per_class_metrics(metrics)
-    err_fig = plot_misclassification_analysis(x_test, y_test, y_pred, y_probs, metrics)
+    cm_fig = plot_confusion_matrix_heatmap(
+        cm,
+        class_names=CLASS_DISPLAY_NAMES,
+        output_path=out_paths["confusion_matrix_figure"],
+        title_label=title_label,
+    )
+    metrics_fig = plot_per_class_metrics(
+        metrics,
+        output_path=out_paths["per_class_metrics_figure"],
+        title_label=f"{title_label} (Test Set)",
+    )
+    err_fig = plot_misclassification_analysis(
+        x_test,
+        y_test,
+        y_pred,
+        y_probs,
+        metrics,
+        output_path=out_paths["misclassification_figure"],
+        title_label=f"{title_label} (Test Set)",
+    )
 
-    CLASSIFICATION_REPORT_TXT.write_text(report_text + "\n", encoding="utf-8")
+    out_paths["classification_report_txt"].write_text(report_text + "\n", encoding="utf-8")
 
     payload: dict[str, Any] = {
+        "experiment": experiment,
+        "model_name": model.name,
+        "model_params": int(model.count_params()),
+        "model_size_mb": model_size_mb,
+        "device": device_str,
         "evaluated_at_utc": datetime.now(timezone.utc).isoformat(),
-        "model_path": model_path.relative_to(PROJECT_ROOT).as_posix(),
+        "model_path": resolved_model_path.resolve().relative_to(PROJECT_ROOT.resolve()).as_posix(),
         "test_source": "data/raw/test/",
         "evaluation_time_seconds": round(eval_elapsed, 2),
+        "total_inference_time_sec": round(total_inference_time_sec, 4),
+        "inference_time_ms_per_image": round(inference_time_ms_per_image, 4),
         "test_loss": round(float(test_loss), 6),
         "keras_test_accuracy": round(float(keras_test_acc), 6),
         "top2_accuracy": round(top2_acc, 6),
@@ -582,32 +543,44 @@ def evaluate(
             "confusion_matrix_figure": cm_fig.relative_to(PROJECT_ROOT).as_posix(),
             "per_class_metrics_figure": metrics_fig.relative_to(PROJECT_ROOT).as_posix(),
             "misclassification_figure": err_fig.relative_to(PROJECT_ROOT).as_posix(),
-            "classification_report_txt": CLASSIFICATION_REPORT_TXT.relative_to(PROJECT_ROOT).as_posix(),
-            "metrics_json": EVAL_METRICS_JSON.relative_to(PROJECT_ROOT).as_posix(),
-            "evaluation_report_md": EVALUATION_REPORT_MD.relative_to(PROJECT_ROOT).as_posix(),
+            "classification_report_txt": out_paths["classification_report_txt"].relative_to(PROJECT_ROOT).as_posix(),
+            "metrics_json": out_paths["metrics_json"].relative_to(PROJECT_ROOT).as_posix(),
+            "evaluation_report_md": out_paths["evaluation_report_md"].relative_to(PROJECT_ROOT).as_posix(),
         },
     }
 
-    EVAL_METRICS_JSON.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    write_evaluation_report_md(payload, report_text, output_path=EVALUATION_REPORT_MD)
+    out_paths["metrics_json"].write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    write_evaluation_report_md(payload, report_text, output_path=out_paths["evaluation_report_md"])
 
     print(f"\nEvaluasi selesai dalam {eval_elapsed:.1f}s pada {len(y_test):,} citra test.")
-    print(f"Test Loss     : {test_loss:.4f}")
-    print(f"Test Accuracy : {metrics['accuracy'] * 100:.2f}% ({metrics['correct_predictions']:,}/{metrics['total_samples']:,})")
-    print(f"Top-2 Accuracy: {top2_acc * 100:.2f}%")
-    print(f"Macro F1      : {metrics['macro_avg']['f1_score'] * 100:.2f}%")
-    print(f"Weighted F1   : {metrics['weighted_avg']['f1_score'] * 100:.2f}%\n")
+    print(f"Model Size       : {model_size_mb:.4f} MB ({model.count_params():,} params)")
+    print(f"Inference Time   : {inference_time_ms_per_image:.4f} ms/citra ({total_inference_time_sec:.3f}s total)")
+    print(f"Test Loss        : {test_loss:.4f}")
+    print(f"Test Accuracy    : {metrics['accuracy'] * 100:.2f}% ({metrics['correct_predictions']:,}/{metrics['total_samples']:,})")
+    print(f"Top-2 Accuracy   : {top2_acc * 100:.2f}%")
+    print(f"Macro F1         : {metrics['macro_avg']['f1_score'] * 100:.2f}%")
+    print(f"Weighted F1      : {metrics['weighted_avg']['f1_score'] * 100:.2f}%\n")
     print(report_text)
-    print("\nTop 5 Pasangan Ekspresi Tertukar:")
-    for p in metrics["top_confused_pairs"][:5]:
-        print(f"  {p['true_class']} -> {p['pred_class']}: {p['count']} ({p['pct_of_true_class']:.2f}%)")
-    print(f"\nGrafik tersimpan : {cm_fig}, {metrics_fig}, {err_fig}")
-    print(f"Laporan tersimpan: {CLASSIFICATION_REPORT_TXT}, {EVAL_METRICS_JSON}, {EVALUATION_REPORT_MD}")
     return payload
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Evaluate a trained FER-2013 Keras model on the test set.")
+    parser.add_argument("--experiment", type=str, default="baseline", help="Experiment identifier (default: baseline)")
+    parser.add_argument("--model-path", type=Path, default=None, help="Optional explicit path to .keras model")
+    parser.add_argument("--output-prefix", type=str, default=None, help="Optional output filename prefix")
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE, help=f"Batch size (default: {DEFAULT_BATCH_SIZE})")
+    return parser.parse_args()
+
+
 def main() -> None:
-    evaluate()
+    args = _parse_args()
+    evaluate(
+        model_path=args.model_path,
+        experiment=args.experiment,
+        output_prefix=args.output_prefix,
+        batch_size=args.batch_size,
+    )
 
 
 if __name__ == "__main__":

@@ -91,6 +91,11 @@ IMPROVED_DENSE_DROPOUT: float = 0.45
 IMPROVED_L2_WEIGHT_DECAY: float = 1e-4
 IMPROVED_TRANSLATION_RANGE: float = 0.05  # +-5% shift (~2.4 px on 48x48)
 
+# MLP (Model 2) pyramid defaults
+MLP_HIDDEN_UNITS: tuple[int, int, int] = (512, 256, 128)
+MLP_DROPOUTS: tuple[float, float, float] = (0.40, 0.35, 0.30)
+MLP_L2_WEIGHT_DECAY: float = 1e-4
+
 # ---------------------------------------------------------------------------
 # Training defaults & artifact paths (used in src/train.py)
 # ---------------------------------------------------------------------------

@@ -1,7 +1,8 @@
-"""Model Training Pipeline for FER-2013 Custom CNN (TensorFlow & Keras).
+"""Model Training Pipeline for FER-2013 Deep Learning Models (TensorFlow & Keras).
 
-Mendukung eksperimen modular (Baseline & Eksperimen 2+ seperti Improved Custom CNN)
-dengan penyimpanan artefak terpisah agar model Baseline tidak pernah tertimpa.
+Mendukung eksperimen modular melalui model factory/registry (``baseline``,
+``improved``, ``mlp``, dan slot ekspansi ``mobilenetv2``) dengan isolasi artefak
+penuh agar hasil ``baseline`` dan ``exp2`` tidak pernah tertimpa.
 
 Jaminan Metodologis:
 1. HANYA subset Training (22.967 citra) dan Validation (5.742 citra) yang dimuat.
@@ -12,7 +13,9 @@ Jaminan Metodologis:
 3. Data augmentation ringan aktif HANYA di dalam model saat ``training=True``
    (``train_augment=False`` pada loader agar tidak terjadi augmentasi ganda;
    validation selalu dievaluasi tanpa augmentasi).
-4. Mendukung resumable training (``--resume``) dengan konfigurasi yang konsisten.
+4. Mencatat metrik deployment PRD (``model_size_mb`` dan
+   ``val_inference_time_ms_per_image`` dengan 1-batch warm-up) serta mendukung
+   resumable training (``--resume``).
 """
 
 from __future__ import annotations
@@ -20,10 +23,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import matplotlib
 matplotlib.use("Agg")
@@ -62,9 +66,58 @@ from src.config import (
     TRAIN_VAL_CACHE_PATH,
 )
 from src.data_loader import build_train_val_loaders
-from src.evaluate import CLASS_DISPLAY_NAMES, compute_classification_metrics
-from src.model import build_improved_model, build_model, compile_model
+from src.metrics import CLASS_DISPLAY_NAMES, compute_classification_metrics
+from src.model import build_improved_model, build_mlp_model, build_model, compile_model
 from src.preprocessing import compute_balanced_class_weights, normalize_pixels
+
+
+def _build_mobilenetv2_placeholder(*args: Any, **kwargs: Any) -> keras.Model:
+    raise NotImplementedError(
+        "Model variant 'mobilenetv2' belum diimplementasikan. "
+        "Tambahkan build_mobilenetv2_model() di src/model.py lalu daftarkan pada MODEL_REGISTRY."
+    )
+
+
+MODEL_REGISTRY: dict[str, Callable[..., keras.Model]] = {
+    "baseline": build_model,
+    "improved": build_improved_model,
+    "mlp": build_mlp_model,
+    "mobilenetv2": _build_mobilenetv2_placeholder,
+}
+
+VARIANT_DISPLAY_NAMES: dict[str, str] = {
+    "baseline": "Baseline CNN",
+    "improved": "Improved CNN",
+    "mlp": "MLP",
+    "mobilenetv2": "MobileNetV2",
+}
+
+
+def configure_gpu() -> str:
+    """Konfigurasi GPU memory growth secara aman; tetap berjalan normal pada CPU."""
+    gpus = tf.config.list_physical_devices("GPU")
+    if gpus:
+        for gpu in gpus:
+            try:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            except RuntimeError:
+                pass
+        return f"GPU ({len(gpus)} device)"
+    return "CPU (TensorFlow oneDNN)"
+
+
+def create_model_by_variant(
+    model_variant: str,
+    seed: int = RANDOM_SEED,
+    use_data_augmentation: bool = True,
+) -> keras.Model:
+    """Factory builder untuk memilih arsitektur model secara terpusat."""
+    if model_variant not in MODEL_REGISTRY:
+        raise ValueError(
+            f"Unknown model_variant '{model_variant}'. Supported: {sorted(MODEL_REGISTRY.keys())}"
+        )
+    builder = MODEL_REGISTRY[model_variant]
+    return builder(use_data_augmentation=use_data_augmentation, seed=seed)
 
 
 class EpochProgressCallback(keras.callbacks.Callback):
@@ -100,7 +153,7 @@ class EpochProgressCallback(keras.callbacks.Callback):
 
 
 def resolve_experiment_paths(experiment: str) -> dict[str, Path]:
-    """Menentukan path artefak terisolasi per eksperimen agar baseline tidak tertimpa."""
+    """Menentukan path artefak terisolasi per eksperimen (backward-compatible untuk baseline & exp2)."""
     if experiment == "baseline":
         return {
             "best_model": BEST_MODEL_PATH,
@@ -124,8 +177,8 @@ def resolve_experiment_paths(experiment: str) -> dict[str, Path]:
             "val_compare_figure": FIGURES_DIR / "15_val_baseline_vs_exp2.png",
         }
     return {
-        "best_model": MODELS_DIR / f"fer2013_cnn_{experiment}.keras",
-        "last_model": MODELS_DIR / f"fer2013_cnn_{experiment}_last.keras",
+        "best_model": MODELS_DIR / f"fer2013_{experiment}.keras",
+        "last_model": MODELS_DIR / f"fer2013_{experiment}_last.keras",
         "history_csv": REPORTS_DIR / f"{experiment}_training_history.csv",
         "history_json": REPORTS_DIR / f"{experiment}_training_history.json",
         "report_md": REPORTS_DIR / f"{experiment}_training_report.md",
@@ -147,12 +200,7 @@ def load_train_val_arrays_cached(
     random_seed: int = RANDOM_SEED,
     cache_path: Path = TRAIN_VAL_CACHE_PATH,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool]:
-    """Memuat (X_train, y_train, X_val, y_val) ternormalisasi [0,1] tanpa menyentuh TEST.
-
-    Menggunakan cache lossless uint8 di ``data/processed/`` yang divalidasi terhadap
-    hash ``train.csv`` & ``val.csv`` agar pemuatan ulang cepat (<1s) sambil tetap
-    menjaga normalisasi tunggal lewat ``normalize_pixels()`` dan tidak menyentuh ``data/raw/``.
-    """
+    """Memuat (X_train, y_train, X_val, y_val) ternormalisasi [0,1] tanpa menyentuh TEST."""
     sig = _splits_signature(SPLITS_DIR)
     if cache_path.exists():
         with np.load(cache_path, allow_pickle=False) as cached:
@@ -161,12 +209,10 @@ def load_train_val_arrays_cached(
                 y_tr = cached["y_train"].astype(np.int64)
                 x_va_u8 = cached["x_val_uint8"]
                 y_va = cached["y_val"].astype(np.int64)
-                # Normalisasi tunggal melalui guard anti-double-normalization
                 x_tr = normalize_pixels(x_tr_u8)
                 x_va = normalize_pixels(x_va_u8)
                 return x_tr, y_tr, x_va, y_va, True
 
-    # Build fresh from data/splits/train.csv & val.csv (TEST tetap diisolasi)
     tv_bundle = build_train_val_loaders(
         batch_size=batch_size,
         random_seed=random_seed,
@@ -175,7 +221,6 @@ def load_train_val_arrays_cached(
     x_tr, y_tr = tv_bundle.train_loader.load_all_arrays(augment=False)
     x_va, y_va = tv_bundle.val_loader.load_all_arrays(augment=False)
 
-    # Simpan cache uint8 lossless agar eksperimen selanjutnya cepat
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
     x_tr_u8 = np.rint(x_tr * 255.0).astype(np.uint8)
     x_va_u8 = np.rint(x_va * 255.0).astype(np.uint8)
@@ -235,15 +280,25 @@ def build_tf_datasets(
 def evaluate_on_validation(
     model: keras.Model,
     val_ds: tf.data.Dataset,
+    x_val: np.ndarray,
     y_val: np.ndarray,
+    batch_size: int = DEFAULT_BATCH_SIZE,
 ) -> dict[str, Any]:
-    """Evaluasi lengkap pada Validation Set (TIDAK menyentuh Test Set)."""
+    """Evaluasi lengkap + waktu inferensi (1-batch warm-up) pada Validation Set (NO test)."""
     val_loss, val_acc = model.evaluate(val_ds, verbose=0)
+
+    # 1-batch warm-up sebelum timer inferensi dimulai
+    _ = model.predict(x_val[:batch_size], batch_size=batch_size, verbose=0)
+    t_inf_start = time.perf_counter()
     y_probs = model.predict(val_ds, verbose=0)
+    total_inf_sec = time.perf_counter() - t_inf_start
+    inf_ms_per_img = (total_inf_sec / len(y_val)) * 1000.0
+
     y_pred = np.argmax(y_probs, axis=1).astype(np.int64)
     top2_preds = np.argsort(y_probs, axis=1)[:, -2:]
     top2_acc = float(np.mean([y_val[i] in top2_preds[i] for i in range(len(y_val))]))
     metrics = compute_classification_metrics(y_val, y_pred, class_names=CLASS_DISPLAY_NAMES)
+
     return {
         "val_loss": round(float(val_loss), 6),
         "val_accuracy": round(float(val_acc), 6),
@@ -252,6 +307,8 @@ def evaluate_on_validation(
         "val_macro_recall": metrics["macro_avg"]["recall"],
         "val_macro_f1": metrics["macro_avg"]["f1_score"],
         "val_weighted_f1": metrics["weighted_avg"]["f1_score"],
+        "val_total_inference_time_sec": round(total_inf_sec, 4),
+        "val_inference_time_ms_per_image": round(inf_ms_per_img, 4),
         "per_class": metrics["per_class"],
         "top_confused_pairs": metrics["top_confused_pairs"][:5],
     }
@@ -355,12 +412,11 @@ def plot_val_comparison(
     exp_label: str,
     output_path: Path,
 ) -> Path:
-    """Membuat grafik perbandingan Baseline vs Eksperimen Baru pada Validation Set (NO test)."""
+    """Membuat grafik perbandingan dinamis Baseline vs Eksperimen pada Validation Set (NO test)."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     fig, axes = plt.subplots(1, 2, figsize=(15.0, 5.6), gridspec_kw={"width_ratios": [1.0, 1.85]})
 
-    # Panel kiri: Metrik agregat Validation
     metric_names = ["Val\nAccuracy", "Val Top-2\nAccuracy", "Val\nMacro F1", "Val\nWeighted F1"]
     b_vals = [
         baseline_val["val_accuracy"] * 100,
@@ -377,7 +433,7 @@ def plot_val_comparison(
 
     x0 = np.arange(len(metric_names))
     w = 0.35
-    bars_b0 = axes[0].bar(x0 - w / 2, b_vals, w, label="Exp 1: Baseline (111K)", color="#7A93AC", edgecolor="#222222", linewidth=0.6)
+    bars_b0 = axes[0].bar(x0 - w / 2, b_vals, w, label="Exp 1: Baseline CNN (111K)", color="#7A93AC", edgecolor="#222222", linewidth=0.6)
     bars_e0 = axes[0].bar(x0 + w / 2, e_vals, w, label=exp_label, color="#2A9D8F", edgecolor="#222222", linewidth=0.6)
 
     for bars in (bars_b0, bars_e0):
@@ -394,13 +450,12 @@ def plot_val_comparison(
     axes[0].spines["right"].set_visible(False)
     axes[0].legend(loc="upper left", frameon=True, facecolor="white", fontsize=8.8)
 
-    # Panel kanan: F1-Score per kelas pada Validation
     b_f1s = [r["f1_score"] * 100 for r in baseline_val["per_class"]]
     e_f1s = [r["f1_score"] * 100 for r in exp_val["per_class"]]
     cls_names = [r["class_name"] for r in exp_val["per_class"]]
     x1 = np.arange(len(cls_names))
 
-    bars_b1 = axes[1].bar(x1 - w / 2, b_f1s, w, label="Exp 1: Baseline (balanced)", color="#7A93AC", edgecolor="#222222", linewidth=0.6)
+    bars_b1 = axes[1].bar(x1 - w / 2, b_f1s, w, label="Exp 1: Baseline CNN (balanced)", color="#7A93AC", edgecolor="#222222", linewidth=0.6)
     bars_e1 = axes[1].bar(x1 + w / 2, e_f1s, w, label=exp_label, color="#E76F51", edgecolor="#222222", linewidth=0.6)
 
     for bars in (bars_b1, bars_e1):
@@ -417,7 +472,7 @@ def plot_val_comparison(
     axes[1].spines["right"].set_visible(False)
     axes[1].legend(loc="upper right", frameon=True, facecolor="white", fontsize=8.8)
 
-    fig.suptitle(f"Evaluasi Validation Set: Baseline vs {exp_label} (Test Set Tetap Terisolasi)", fontsize=13.5, fontweight="bold", y=1.02)
+    fig.suptitle(f"Evaluasi Validation Set: Baseline CNN vs {exp_label} (Test Set Tetap Terisolasi)", fontsize=13.5, fontweight="bold", y=1.02)
     plt.tight_layout()
     fig.savefig(output_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
@@ -428,7 +483,7 @@ def write_training_report(
     summary: dict[str, Any],
     report_path: Path,
 ) -> Path:
-    """Menyusun laporan Markdown faktual berdasarkan hasil training & evaluasi validation aktual."""
+    """Menyusun laporan Markdown faktual berdasarkan hasil training, validation & deployment PRD."""
     report_path.parent.mkdir(parents=True, exist_ok=True)
     best = summary["best_epoch_metrics"]
     final = summary["final_epoch_metrics"]
@@ -469,7 +524,7 @@ def write_training_report(
 
 ## 4. Perbandingan Head-to-Head pada Validation Set (5.742 Citra, Tanpa Test)
 
-| Metrik (Validation Set) | Exp 1: Baseline (`111K`, `balanced`) | `{summary['experiment'].upper()}` (`{cfg['model_variant']}`, `{cfg['class_weight_mode']}`) | Delta |
+| Metrik (Validation Set) | Exp 1: Baseline CNN (`111K`, `balanced`) | `{summary['experiment'].upper()}` (`{cfg['model_variant']}`, `{cfg['class_weight_mode']}`) | Delta |
 |---|---:|---:|---:|
 | **Validation Accuracy** | {base_val['val_accuracy'] * 100:.2f}% | **{val_eval['val_accuracy'] * 100:.2f}%** | `{d_acc:+.2f} pp` |
 | **Validation Loss** | {base_val['val_loss']:.4f} | **{val_eval['val_loss']:.4f}** | `{d_loss:+.4f}` |
@@ -484,15 +539,15 @@ def write_training_report(
 {cls_cmp_rows}
 """
 
-    md = f"""# Laporan Model Training — {summary['experiment'].upper()} ({cfg['model_variant']})
+    md = f"""# Laporan Model Training — {summary['experiment'].upper()} ({summary['model_name']})
 
-**Proyek:** Klasifikasi Ekspresi Wajah Manusia pada Citra Grayscale (FER-2013) Menggunakan Convolutional Neural Network  
-**Eksperimen:** `{summary['experiment']}` (Arsitektur: `{cfg['model_variant']}`, `{summary['model_params']['total']:,}` parameter)  
+**Proyek:** Klasifikasi Ekspresi Wajah Manusia pada Citra Grayscale (FER-2013)  
+**Eksperimen:** `{summary['experiment']}` (Varian: `{cfg['model_variant']}`, `{summary['model_params']['total']:,}` parameter, `{summary['model_size_mb']:.4f} MB`)  
 **Waktu Selesai (UTC):** `{summary['completed_at_utc']}`
 
 ---
 
-## 1. Konfigurasi & Isolasi Data
+## 1. Konfigurasi, Isolasi Data & Metrik Deployment PRD
 
 | Parameter | Nilai |
 |---|---|
@@ -501,6 +556,8 @@ def write_training_report(
 | Data Testing selama Training & Seleksi | **Tidak diakses / tidak digunakan (`0` citra)** |
 | Input Shape | `{cfg['input_shape']}` (grayscale 1 kanal, normalisasi tunggal `[0, 1]`) |
 | Total / Trainable / Non-Trainable Params | `{summary['model_params']['total']:,}` / `{summary['model_params']['trainable']:,}` / `{summary['model_params']['non_trainable']:,}` |
+| **Model Size (`model_size_mb`)** | **`{summary['model_size_mb']:.4f} MB`** |
+| **Val Inference Time (`val_inference_time_ms_per_image`)** | **`{summary['val_inference_time_ms_per_image']:.4f} ms/citra`** (`{val_eval['val_total_inference_time_sec']:.3f}s` total, setelah 1-batch warm-up) |
 | Max Epochs / Batch Size | `{cfg['max_epochs']}` / `{cfg['batch_size']}` |
 | Optimizer & Initial LR | `Adam` (`lr = {cfg['learning_rate']}`) |
 | Loss & Metric | `SparseCategoricalCrossentropy` / `accuracy` |
@@ -528,6 +585,7 @@ def write_training_report(
 ## 3. Evaluasi Detail pada Validation Set (`5.742` Citra)
 
 - **Val Accuracy:** **{val_eval['val_accuracy'] * 100:.2f}%** | **Val Loss:** `{val_eval['val_loss']:.4f}` | **Val Top-2 Acc:** `{val_eval['val_top2_accuracy'] * 100:.2f}%`
+- **Val Macro Precision:** `{val_eval['val_macro_precision'] * 100:.2f}%` | **Val Macro Recall:** `{val_eval['val_macro_recall'] * 100:.2f}%`
 - **Val Macro F1:** **{val_eval['val_macro_f1'] * 100:.2f}%** | **Val Weighted F1:** **{val_eval['val_weighted_f1'] * 100:.2f}%**
 
 | ID | Kelas | Val Precision | Val Recall | Val F1-Score | Support |
@@ -576,16 +634,14 @@ def train(
     random_seed: int = RANDOM_SEED,
     resume: bool = False,
 ) -> dict[str, Any]:
-    """Menjalankan proses training Custom CNN secara penuh dengan isolasi artefak per eksperimen."""
+    """Menjalankan proses training model secara penuh dengan isolasi artefak per eksperimen."""
+    device_str = configure_gpu()
     keras.utils.set_random_seed(random_seed)
 
     paths = resolve_experiment_paths(experiment)
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     FIGURES_DIR.mkdir(parents=True, exist_ok=True)
-
-    gpus = tf.config.list_physical_devices("GPU")
-    device_str = f"GPU ({len(gpus)} device)" if gpus else "CPU (TensorFlow oneDNN)"
 
     print(f"=== EKSPERIMEN '{experiment}' (variant='{model_variant}') | TEST DIISOLASI ===", flush=True)
     t_load_start = time.perf_counter()
@@ -601,7 +657,7 @@ def train(
     assert 0.0 <= float(x_val.min()) <= float(x_val.max()) <= 1.0
 
     print(
-        f"Data dimuat dalam {load_elapsed:.1f}s (from_cache={from_cache}) | "
+        f"Data dimuat dalam {load_elapsed:.2f}s (from_cache={from_cache}) | "
         f"Train={x_train.shape} | Val={x_val.shape}",
         flush=True,
     )
@@ -630,12 +686,11 @@ def train(
                 f"Training sudah mencapai epoch {initial_epoch} >= max_epochs ({max_epochs})."
             )
     else:
-        if model_variant == "baseline":
-            model = build_model(use_data_augmentation=True, seed=random_seed)
-        elif model_variant == "improved":
-            model = build_improved_model(use_data_augmentation=True, seed=random_seed)
-        else:
-            raise ValueError(f"Unknown model_variant '{model_variant}'. Use 'baseline' or 'improved'.")
+        model = create_model_by_variant(
+            model_variant=model_variant,
+            seed=random_seed,
+            use_data_augmentation=True,
+        )
         model = compile_model(model, learning_rate=learning_rate)
 
     total_params = int(model.count_params())
@@ -683,12 +738,14 @@ def train(
     )
     t_train_start = time.perf_counter()
 
+    # shuffle=False karena train_ds sudah di-shuffle melalui tf.data.Dataset.shuffle()
     history = model.fit(
         train_ds,
         validation_data=val_ds,
         epochs=max_epochs,
         initial_epoch=initial_epoch,
         class_weight=class_weights,
+        shuffle=False,
         callbacks=[early_stopping_cb, reduce_lr_cb, best_ckpt_cb, last_ckpt_cb, progress_cb],
         verbose=0,
     )
@@ -713,7 +770,11 @@ def train(
         "learning_rate": lr_series,
         "epoch_time_sec": progress_cb.epoch_times[:n_new],
     })
-    history_df = pd.concat([prior_history_df, new_history_df], ignore_index=True) if prior_history_df is not None else new_history_df
+    history_df = (
+        pd.concat([prior_history_df, new_history_df], ignore_index=True)
+        if prior_history_df is not None
+        else new_history_df
+    )
 
     best_idx = int(history_df["val_loss"].idxmin())
     best_row = history_df.iloc[best_idx]
@@ -722,18 +783,33 @@ def train(
     epochs_executed = int(len(history_df))
     early_stopped = epochs_executed < max_epochs
 
-    # Evaluasi mendalam pada VALIDATION SET (TEST tetap 100% terisolasi!)
+    # Evaluasi mendalam + metrik deployment PRD pada VALIDATION SET (TEST tetap 100% terisolasi!)
     best_loaded_model = keras.models.load_model(paths["best_model"])
-    val_eval = evaluate_on_validation(best_loaded_model, val_ds, y_val)
+    model_size_mb = round(os.path.getsize(paths["best_model"]) / (1024 ** 2), 4)
+    val_eval = evaluate_on_validation(
+        best_loaded_model,
+        val_ds=val_ds,
+        x_val=x_val,
+        y_val=y_val,
+        batch_size=batch_size,
+    )
 
-    # Jika bukan baseline dan model baseline ada, bandingkan langsung pada VALIDATION SET yang sama
+    # Perbandingan langsung pada VALIDATION SET terhadap Baseline jika bukan baseline
     baseline_val_eval: dict[str, Any] | None = None
     val_compare_fig: Path | None = None
     if experiment != "baseline" and BEST_MODEL_PATH.exists():
-        print("\nMengevaluasi Baseline pada Validation Set yang sama untuk perbandingan adil...", flush=True)
+        print("\nMengevaluasi Baseline CNN pada Validation Set yang sama untuk perbandingan adil...", flush=True)
         baseline_model = keras.models.load_model(BEST_MODEL_PATH)
-        baseline_val_eval = evaluate_on_validation(baseline_model, val_ds, y_val)
-        exp_label = f"{experiment.upper()}: Improved CNN ({total_params // 1000}K, {class_weight_mode})"
+        baseline_val_eval = evaluate_on_validation(
+            baseline_model,
+            val_ds=val_ds,
+            x_val=x_val,
+            y_val=y_val,
+            batch_size=batch_size,
+        )
+        variant_name = VARIANT_DISPLAY_NAMES.get(model_variant, model.name)
+        param_str = f"{total_params / 1_000_000:.2f}M" if total_params >= 1_000_000 else f"{total_params // 1000}K"
+        exp_label = f"{experiment.upper()}: {variant_name} ({param_str}, {class_weight_mode})"
         val_compare_fig = plot_val_comparison(
             baseline_val=baseline_val_eval,
             exp_val=val_eval,
@@ -768,6 +844,7 @@ def train(
 
     summary: dict[str, Any] = {
         "experiment": experiment,
+        "model_name": model.name,
         "completed_at_utc": datetime.now(timezone.utc).isoformat(),
         "device": device_str,
         "tensorflow_version": tf.__version__,
@@ -782,6 +859,9 @@ def train(
             "trainable": trainable_params,
             "non_trainable": non_trainable_params,
         },
+        "model_size_mb": model_size_mb,
+        "val_inference_time_ms_per_image": val_eval["val_inference_time_ms_per_image"],
+        "val_total_inference_time_sec": val_eval["val_total_inference_time_sec"],
         "data_counts": {
             "train": int(len(x_train)),
             "val": int(len(x_val)),
@@ -835,6 +915,8 @@ def train(
     write_training_report(summary=summary, report_path=paths["report_md"])
 
     print(f"\n================ RINGKASAN HASIL TRAINING ({experiment.upper()}) ================")
+    print(f"Model                   : {model.name} ({total_params:,} params | {model_size_mb:.4f} MB)")
+    print(f"Val Inference Time      : {val_eval['val_inference_time_ms_per_image']:.4f} ms/citra ({val_eval['val_total_inference_time_sec']:.3f}s total)")
     print(f"Epoch yang dijalankan   : {epochs_executed} / {max_epochs} (best epoch = {best_epoch}, early_stopped = {early_stopped})")
     print(f"Total waktu training    : {summary['training_time_formatted']} ({summary['avg_seconds_per_epoch']:.2f} s/epoch)")
     print(f"Best Epoch #{best_epoch:02d} Metrics :")
@@ -842,7 +924,13 @@ def train(
     print(f"  Validation Accuracy   : {best_row['val_accuracy'] * 100:.2f}% ({best_row['val_accuracy']:.4f})")
     print(f"  Training Loss         : {best_row['loss']:.4f}")
     print(f"  Validation Loss       : {best_row['val_loss']:.4f}")
-    print(f"Validation Detailed     : Macro F1={val_eval['val_macro_f1'] * 100:.2f}% | Weighted F1={val_eval['val_weighted_f1'] * 100:.2f}% | Top-2={val_eval['val_top2_accuracy'] * 100:.2f}%")
+    print(
+        f"Validation Detailed     : Macro P={val_eval['val_macro_precision'] * 100:.2f}% | "
+        f"Macro R={val_eval['val_macro_recall'] * 100:.2f}% | "
+        f"Macro F1={val_eval['val_macro_f1'] * 100:.2f}% | "
+        f"Weighted F1={val_eval['val_weighted_f1'] * 100:.2f}% | "
+        f"Top-2={val_eval['val_top2_accuracy'] * 100:.2f}%"
+    )
     if baseline_val_eval is not None:
         print(
             f"Vs Baseline (VAL)       : Acc {baseline_val_eval['val_accuracy']*100:.2f}% -> {val_eval['val_accuracy']*100:.2f}% "
@@ -857,9 +945,9 @@ def train(
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train FER-2013 Custom CNN (Train & Validation only).")
-    parser.add_argument("--experiment", type=str, default="baseline", help="Experiment name (e.g., baseline, exp2)")
-    parser.add_argument("--model-variant", choices=["baseline", "improved"], default="baseline", help="CNN architecture variant")
+    parser = argparse.ArgumentParser(description="Train FER-2013 Deep Learning models (Train & Validation only).")
+    parser.add_argument("--experiment", type=str, default="baseline", help="Experiment name (e.g., baseline, exp2, mlp, mobilenetv2)")
+    parser.add_argument("--model-variant", choices=sorted(MODEL_REGISTRY.keys()), default="baseline", help="Model architecture variant")
     parser.add_argument("--epochs", type=int, default=MAX_EPOCHS, help=f"Max epochs (default: {MAX_EPOCHS})")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE, help=f"Batch size (default: {DEFAULT_BATCH_SIZE})")
     parser.add_argument("--lr", type=float, default=DEFAULT_LEARNING_RATE, help=f"Initial learning rate (default: {DEFAULT_LEARNING_RATE})")

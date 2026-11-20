@@ -43,6 +43,9 @@ from src.config import (
     IMPROVED_L2_WEIGHT_DECAY,
     IMPROVED_TRANSLATION_RANGE,
     INPUT_SHAPE,
+    MLP_DROPOUTS,
+    MLP_HIDDEN_UNITS,
+    MLP_L2_WEIGHT_DECAY,
     NUM_CLASSES,
     POOL_SIZE,
     RANDOM_SEED,
@@ -350,6 +353,79 @@ def build_improved_model(
     )(x)
 
     model = keras.Model(inputs=inputs, outputs=outputs, name="FER2013_Improved_Custom_CNN")
+    return model
+
+
+def build_mlp_model(
+    input_shape: tuple[int, int, int] = INPUT_SHAPE,
+    num_classes: int = NUM_CLASSES,
+    hidden_units: tuple[int, int, int] = MLP_HIDDEN_UNITS,
+    dropouts: tuple[float, float, float] = MLP_DROPOUTS,
+    l2_weight_decay: float = MLP_L2_WEIGHT_DECAY,
+    use_data_augmentation: bool = True,
+    aug_config: AugmentationConfig = DEFAULT_AUGMENTATION_CONFIG,
+    translation_range: float = IMPROVED_TRANSLATION_RANGE,
+    seed: int = RANDOM_SEED,
+) -> keras.Model:
+    """Membangun arsitektur Multi-Layer Perceptron (MLP) pyramid dari awal untuk FER-2013.
+
+    Dirancang apple-to-apple dengan Improved CNN:
+    - Input (48, 48, 1) ternormalisasi [0.0, 1.0].
+    - Augmentasi on-the-fly identik (Flip horizontal, Rot +-10 deg, Zoom +-10%,
+      Translation +-5%), hanya aktif saat ``training=True``.
+    - Flatten() -> 2.304 fitur piksel.
+    - 3 Hidden Dense Blocks (512 -> 256 -> 128) dengan He initialization, L2(1e-4),
+      BatchNormalization, ReLU, dan Dropout (0.40 -> 0.35 -> 0.30).
+    - Output Dense(7, activation="softmax", dtype="float32").
+    """
+    if len(input_shape) != 3 or input_shape[-1] != 1:
+        raise ValueError(
+            f"Model ini khusus citra grayscale 1 kanal (H, W, 1); diterima input_shape={input_shape}"
+        )
+    if len(hidden_units) != 3 or len(dropouts) != 3:
+        raise ValueError("hidden_units dan dropouts harus masing-masing berisi tepat 3 nilai.")
+
+    reg = keras.regularizers.l2(l2_weight_decay) if l2_weight_decay > 0.0 else None
+
+    # 1. INPUT LAYER (48x48x1 grayscale ternormalisasi [0, 1])
+    inputs = keras.Input(shape=input_shape, name="input_grayscale")
+    x = inputs
+
+    # 2. DATA AUGMENTATION (HANYA AKTIF SAAT training=True)
+    if use_data_augmentation:
+        data_augmentation = build_data_augmentation(
+            aug_config=aug_config,
+            seed=seed,
+            translation_range=translation_range,
+        )
+        x = data_augmentation(x)
+
+    # 3. FLATTEN -> 48 * 48 * 1 = 2.304 fitur
+    x = layers.Flatten(name="flatten_pixels")(x)
+
+    # 4. 3 HIDDEN DENSE BLOCKS (PYRAMID: 512 -> 256 -> 128)
+    for block_idx, (units, drop_rate) in enumerate(zip(hidden_units, dropouts), start=1):
+        prefix = f"mlp_block{block_idx}"
+        x = layers.Dense(
+            units=units,
+            use_bias=False,
+            kernel_initializer="he_normal",
+            kernel_regularizer=reg,
+            name=f"{prefix}_dense",
+        )(x)
+        x = layers.BatchNormalization(name=f"{prefix}_bn")(x)
+        x = layers.Activation("relu", name=f"{prefix}_relu")(x)
+        x = layers.Dropout(rate=drop_rate, name=f"{prefix}_dropout")(x)
+
+    # 5. OUTPUT LAYER (float32 eksplisit untuk kompatibilitas mixed precision)
+    outputs = layers.Dense(
+        units=num_classes,
+        activation="softmax",
+        dtype="float32",
+        name="output_probabilities",
+    )(x)
+
+    model = keras.Model(inputs=inputs, outputs=outputs, name="FER2013_MLP")
     return model
 
 
