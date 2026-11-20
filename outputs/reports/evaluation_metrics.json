@@ -1,0 +1,268 @@
+{
+  "evaluated_at_utc": "2026-11-20T01:00:26.378397+00:00",
+  "model_path": "models/fer2013_cnn.keras",
+  "test_source": "data/raw/test/",
+  "evaluation_time_seconds": 132.24,
+  "test_loss": 1.2605,
+  "keras_test_accuracy": 0.522151,
+  "top2_accuracy": 0.711897,
+  "confidence_stats": {
+    "mean_conf_all": 0.519747,
+    "mean_conf_correct": 0.617383,
+    "mean_conf_incorrect": 0.41306
+  },
+  "label_mapping": {
+    "0": "Angry",
+    "1": "Disgust",
+    "2": "Fear",
+    "3": "Happy",
+    "4": "Neutral",
+    "5": "Sad",
+    "6": "Surprise"
+  },
+  "metrics": {
+    "accuracy": 0.522151,
+    "total_samples": 7178,
+    "correct_predictions": 3748,
+    "incorrect_predictions": 3430,
+    "per_class": [
+      {
+        "label_id": 0,
+        "class_name": "Angry",
+        "precision": 0.394934,
+        "recall": 0.439457,
+        "f1_score": 0.416008,
+        "support": 958,
+        "predicted_count": 1066,
+        "correct_count": 421
+      },
+      {
+        "label_id": 1,
+        "class_name": "Disgust",
+        "precision": 0.152893,
+        "recall": 0.666667,
+        "f1_score": 0.248739,
+        "support": 111,
+        "predicted_count": 484,
+        "correct_count": 74
+      },
+      {
+        "label_id": 2,
+        "class_name": "Fear",
+        "precision": 0.322314,
+        "recall": 0.076172,
+        "f1_score": 0.123223,
+        "support": 1024,
+        "predicted_count": 242,
+        "correct_count": 78
+      },
+      {
+        "label_id": 3,
+        "class_name": "Happy",
+        "precision": 0.765067,
+        "recall": 0.77283,
+        "f1_score": 0.768929,
+        "support": 1774,
+        "predicted_count": 1792,
+        "correct_count": 1371
+      },
+      {
+        "label_id": 4,
+        "class_name": "Neutral",
+        "precision": 0.449911,
+        "recall": 0.615572,
+        "f1_score": 0.519863,
+        "support": 1233,
+        "predicted_count": 1687,
+        "correct_count": 759
+      },
+      {
+        "label_id": 5,
+        "class_name": "Sad",
+        "precision": 0.457769,
+        "recall": 0.352045,
+        "f1_score": 0.398005,
+        "support": 1247,
+        "predicted_count": 959,
+        "correct_count": 439
+      },
+      {
+        "label_id": 6,
+        "class_name": "Surprise",
+        "precision": 0.639241,
+        "recall": 0.729242,
+        "f1_score": 0.681282,
+        "support": 831,
+        "predicted_count": 948,
+        "correct_count": 606
+      }
+    ],
+    "macro_avg": {
+      "precision": 0.45459,
+      "recall": 0.521712,
+      "f1_score": 0.450864,
+      "support": 7178
+    },
+    "weighted_avg": {
+      "precision": 0.520951,
+      "recall": 0.522151,
+      "f1_score": 0.504298,
+      "support": 7178
+    },
+    "confusion_matrix": [
+      [
+        421,
+        119,
+        27,
+        60,
+        190,
+        92,
+        49
+      ],
+      [
+        20,
+        74,
+        2,
+        3,
+        6,
+        4,
+        2
+      ],
+      [
+        178,
+        81,
+        78,
+        80,
+        225,
+        194,
+        188
+      ],
+      [
+        90,
+        40,
+        29,
+        1371,
+        117,
+        75,
+        52
+      ],
+      [
+        114,
+        54,
+        22,
+        114,
+        759,
+        141,
+        29
+      ],
+      [
+        200,
+        93,
+        52,
+        113,
+        328,
+        439,
+        22
+      ],
+      [
+        43,
+        23,
+        32,
+        51,
+        62,
+        14,
+        606
+      ]
+    ],
+    "top_confused_pairs": [
+      {
+        "true_id": 5,
+        "true_class": "Sad",
+        "pred_id": 4,
+        "pred_class": "Neutral",
+        "count": 328,
+        "pct_of_true_class": 26.3
+      },
+      {
+        "true_id": 2,
+        "true_class": "Fear",
+        "pred_id": 4,
+        "pred_class": "Neutral",
+        "count": 225,
+        "pct_of_true_class": 21.97
+      },
+      {
+        "true_id": 5,
+        "true_class": "Sad",
+        "pred_id": 0,
+        "pred_class": "Angry",
+        "count": 200,
+        "pct_of_true_class": 16.04
+      },
+      {
+        "true_id": 2,
+        "true_class": "Fear",
+        "pred_id": 5,
+        "pred_class": "Sad",
+        "count": 194,
+        "pct_of_true_class": 18.95
+      },
+      {
+        "true_id": 0,
+        "true_class": "Angry",
+        "pred_id": 4,
+        "pred_class": "Neutral",
+        "count": 190,
+        "pct_of_true_class": 19.83
+      },
+      {
+        "true_id": 2,
+        "true_class": "Fear",
+        "pred_id": 6,
+        "pred_class": "Surprise",
+        "count": 188,
+        "pct_of_true_class": 18.36
+      },
+      {
+        "true_id": 2,
+        "true_class": "Fear",
+        "pred_id": 0,
+        "pred_class": "Angry",
+        "count": 178,
+        "pct_of_true_class": 17.38
+      },
+      {
+        "true_id": 4,
+        "true_class": "Neutral",
+        "pred_id": 5,
+        "pred_class": "Sad",
+        "count": 141,
+        "pct_of_true_class": 11.44
+      },
+      {
+        "true_id": 0,
+        "true_class": "Angry",
+        "pred_id": 1,
+        "pred_class": "Disgust",
+        "count": 119,
+        "pct_of_true_class": 12.42
+      },
+      {
+        "true_id": 3,
+        "true_class": "Happy",
+        "pred_id": 4,
+        "pred_class": "Neutral",
+        "count": 117,
+        "pct_of_true_class": 6.6
+      }
+    ]
+  },
+  "artifacts": {
+    "confusion_matrix_figure": "outputs/figures/10_test_confusion_matrix.png",
+    "per_class_metrics_figure": "outputs/figures/11_test_per_class_metrics.png",
+    "misclassification_figure": "outputs/figures/12_test_misclassification_analysis.png",
+    "classification_report_txt": "outputs/reports/classification_report.txt",
+    "metrics_json": "outputs/reports/evaluation_metrics.json",
+    "evaluation_report_md": "outputs/reports/evaluation_report.md"
+  }
+}
