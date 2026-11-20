@@ -37,6 +37,11 @@ from src.config import (
     DEFAULT_LEARNING_RATE,
     DENSE_DROPOUT_RATE,
     DENSE_UNITS,
+    IMPROVED_BLOCK_DROPOUTS,
+    IMPROVED_CONV_FILTERS,
+    IMPROVED_DENSE_DROPOUT,
+    IMPROVED_L2_WEIGHT_DECAY,
+    IMPROVED_TRANSLATION_RANGE,
     INPUT_SHAPE,
     NUM_CLASSES,
     POOL_SIZE,
@@ -47,6 +52,7 @@ from src.config import (
 def build_data_augmentation(
     aug_config: AugmentationConfig = DEFAULT_AUGMENTATION_CONFIG,
     seed: int = RANDOM_SEED,
+    translation_range: float = 0.0,
 ) -> keras.Sequential:
     """Membangun blok data augmentation ringan berbasis Keras preprocessing layers.
 
@@ -90,6 +96,19 @@ def build_data_augmentation(
                 interpolation="bilinear",
                 seed=seed + 2,
                 name="aug_light_zoom",
+            )
+        )
+
+    # 4. Translasi ringan opsional (+-5% ~= +-2.4 piksel) untuk variasi alignment wajah
+    if translation_range > 0.0:
+        aug_layers.append(
+            layers.RandomTranslation(
+                height_factor=(-translation_range, translation_range),
+                width_factor=(-translation_range, translation_range),
+                fill_mode="nearest",
+                interpolation="bilinear",
+                seed=seed + 3,
+                name="aug_light_translation",
             )
         )
 
@@ -224,6 +243,113 @@ def build_model(
     )(x)
 
     model = keras.Model(inputs=inputs, outputs=outputs, name="FER2013_Custom_CNN")
+    return model
+
+
+def build_improved_model(
+    input_shape: tuple[int, int, int] = INPUT_SHAPE,
+    num_classes: int = NUM_CLASSES,
+    conv_filters: tuple[int, int, int, int] = IMPROVED_CONV_FILTERS,
+    kernel_size: tuple[int, int] = CONV_KERNEL_SIZE,
+    pool_size: tuple[int, int] = POOL_SIZE,
+    block_dropouts: tuple[float, float, float] = IMPROVED_BLOCK_DROPOUTS,
+    dense_units: int = DENSE_UNITS,
+    dense_dropout_rate: float = IMPROVED_DENSE_DROPOUT,
+    l2_weight_decay: float = IMPROVED_L2_WEIGHT_DECAY,
+    use_data_augmentation: bool = True,
+    aug_config: AugmentationConfig = DEFAULT_AUGMENTATION_CONFIG,
+    translation_range: float = IMPROVED_TRANSLATION_RANGE,
+    seed: int = RANDOM_SEED,
+) -> keras.Model:
+    """Membangun arsitektur Improved Custom CNN (Eksperimen 2+) dari awal (non-pretrained).
+
+    Peningkatan terarah berdasarkan analisis underfitting pada Eksperimen 1 (Baseline):
+    - Pola Double-Conv2D per blok (32-32 -> 64-64 -> 128-128 -> 256) memperluas
+      receptive field untuk menangkap relasi mikro alis, mata, dan mulut sekaligus.
+    - Urutan Conv2D(use_bias=False) -> BatchNormalization -> ReLU menstabilkan
+      gradien dan menghilangkan lonjakan val_loss di epoch awal.
+    - Regularisasi L2 ringan (1e-4) + Dropout progresif (0.20, 0.25, 0.30, 0.45)
+      menjaga generalisasi tetap kuat.
+    - Augmentasi ringan (+ translasi +-5%) tetap hanya aktif saat training=True.
+    """
+    if len(input_shape) != 3 or input_shape[-1] != 1:
+        raise ValueError(
+            f"Model ini khusus citra grayscale 1 kanal (H, W, 1); diterima input_shape={input_shape}"
+        )
+    if len(conv_filters) != 4:
+        raise ValueError(f"conv_filters harus berisi tepat 4 nilai, diterima {conv_filters}")
+
+    reg = keras.regularizers.l2(l2_weight_decay) if l2_weight_decay > 0.0 else None
+
+    # 1. INPUT LAYER (48x48x1 grayscale ternormalisasi [0, 1])
+    inputs = keras.Input(shape=input_shape, name="input_grayscale")
+    x = inputs
+
+    # 2. DATA AUGMENTATION (HANYA AKTIF SAAT training=True)
+    if use_data_augmentation:
+        data_augmentation = build_data_augmentation(
+            aug_config=aug_config,
+            seed=seed,
+            translation_range=translation_range,
+        )
+        x = data_augmentation(x)
+
+    # 3. DOUBLE-CONV BLOCKS 1..3 (32 -> 64 -> 128 filters, resolusi 48 -> 24 -> 12 -> 6)
+    for block_idx in range(3):
+        filters = conv_filters[block_idx]
+        drop_rate = block_dropouts[block_idx]
+        prefix = f"block{block_idx + 1}"
+
+        for conv_idx in (1, 2):
+            x = layers.Conv2D(
+                filters=filters,
+                kernel_size=kernel_size,
+                padding="same",
+                use_bias=False,
+                kernel_initializer="he_normal",
+                kernel_regularizer=reg,
+                name=f"{prefix}_conv{conv_idx}",
+            )(x)
+            x = layers.BatchNormalization(name=f"{prefix}_bn{conv_idx}")(x)
+            x = layers.Activation("relu", name=f"{prefix}_relu{conv_idx}")(x)
+
+        x = layers.MaxPooling2D(pool_size=pool_size, name=f"{prefix}_pool")(x)
+        x = layers.Dropout(rate=drop_rate, name=f"{prefix}_dropout")(x)
+
+    # 4. CONVOLUTIONAL BLOCK 4 (256 filters pada resolusi 6x6 untuk representasi semantik kaya)
+    x = layers.Conv2D(
+        filters=conv_filters[3],
+        kernel_size=kernel_size,
+        padding="same",
+        use_bias=False,
+        kernel_initializer="he_normal",
+        kernel_regularizer=reg,
+        name="block4_conv1",
+    )(x)
+    x = layers.BatchNormalization(name="block4_bn1")(x)
+    x = layers.Activation("relu", name="block4_relu1")(x)
+
+    # 5. CLASSIFICATION BLOCK (GlobalAveragePooling2D -> Dense 128 + BN + ReLU + Dropout)
+    x = layers.GlobalAveragePooling2D(name="global_avg_pool")(x)
+    x = layers.Dense(
+        units=dense_units,
+        use_bias=False,
+        kernel_initializer="he_normal",
+        kernel_regularizer=reg,
+        name="fc_dense",
+    )(x)
+    x = layers.BatchNormalization(name="fc_bn")(x)
+    x = layers.Activation("relu", name="fc_relu")(x)
+    x = layers.Dropout(rate=dense_dropout_rate, name="fc_dropout")(x)
+
+    # 6. OUTPUT LAYER (7 kelas ekspresi wajah -> probabilitas Softmax)
+    outputs = layers.Dense(
+        units=num_classes,
+        activation="softmax",
+        name="output_probabilities",
+    )(x)
+
+    model = keras.Model(inputs=inputs, outputs=outputs, name="FER2013_Improved_Custom_CNN")
     return model
 
 

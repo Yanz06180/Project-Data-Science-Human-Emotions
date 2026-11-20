@@ -19,6 +19,8 @@ RAW_DATA_DIR: Path = DATA_DIR / "raw"
 RAW_TRAIN_DIR: Path = RAW_DATA_DIR / "train"
 RAW_TEST_DIR: Path = RAW_DATA_DIR / "test"
 SPLITS_DIR: Path = DATA_DIR / "splits"
+PROCESSED_DIR: Path = DATA_DIR / "processed"
+TRAIN_VAL_CACHE_PATH: Path = PROCESSED_DIR / "fer2013_train_val_uint8_cache.npz"
 
 OUTPUTS_DIR: Path = PROJECT_ROOT / "outputs"
 FIGURES_DIR: Path = OUTPUTS_DIR / "figures"
@@ -82,6 +84,13 @@ DENSE_UNITS: int = 128
 DENSE_DROPOUT_RATE: float = 0.50
 DEFAULT_LEARNING_RATE: float = 1e-3
 
+# Improved Custom CNN (Experiment 2+) defaults
+IMPROVED_CONV_FILTERS: tuple[int, int, int, int] = (32, 64, 128, 256)
+IMPROVED_BLOCK_DROPOUTS: tuple[float, float, float] = (0.20, 0.25, 0.30)
+IMPROVED_DENSE_DROPOUT: float = 0.45
+IMPROVED_L2_WEIGHT_DECAY: float = 1e-4
+IMPROVED_TRANSLATION_RANGE: float = 0.05  # +-5% shift (~2.4 px on 48x48)
+
 # ---------------------------------------------------------------------------
 # Training defaults & artifact paths (used in src/train.py)
 # ---------------------------------------------------------------------------
@@ -93,6 +102,8 @@ REDUCE_LR_MIN_LR: float = 1e-6
 
 BEST_MODEL_PATH: Path = MODELS_DIR / "fer2013_cnn.keras"
 LAST_MODEL_PATH: Path = MODELS_DIR / "fer2013_cnn_last.keras"
+EXP2_BEST_MODEL_PATH: Path = MODELS_DIR / "fer2013_cnn_exp2.keras"
+EXP2_LAST_MODEL_PATH: Path = MODELS_DIR / "fer2013_cnn_exp2_last.keras"
 TRAINING_HISTORY_CSV: Path = REPORTS_DIR / "training_history.csv"
 TRAINING_HISTORY_JSON: Path = REPORTS_DIR / "training_history.json"
 TRAINING_REPORT_MD: Path = REPORTS_DIR / "training_report.md"
